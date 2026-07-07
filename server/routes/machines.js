@@ -1,103 +1,141 @@
+'use strict';
+
 const express = require('express');
+const { z } = require('zod');
+const config = require('../config');
 const { getDb } = require('../db');
 const { authenticateToken } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { ApiError } = require('../errors');
+const { parseDbTimestamp } = require('../lib/time');
 
 const router = express.Router();
 
-const OFFLINE_THRESHOLD = parseInt(process.env.OFFLINE_THRESHOLD_MINUTES || '30', 10);
+// Status semantics (single source of truth for list + summary):
+// error > offline/online > unknown. A machine whose last update failed is
+// surfaced as "error" regardless of heartbeat recency.
+function computeStatus(machine, now) {
+  if (machine.last_update_result && machine.last_update_result.includes('failure')) {
+    return 'error';
+  }
+  const lastSeen = parseDbTimestamp(machine.last_heartbeat);
+  if (!lastSeen) return 'unknown';
+  const minutesSince = (now.getTime() - lastSeen.getTime()) / 60_000;
+  return minutesSince > config.offlineThresholdMinutes ? 'offline' : 'online';
+}
 
-// GET /api/machines — list all machines grouped by customer/site
+const idParamSchema = z.object({
+  id: z.coerce.number().int().positive(),
+});
+
+const historyQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+// Error machines surface first, then the rest by how much attention they need.
+const STATUS_ORDER = { error: 0, offline: 1, unknown: 2, online: 3 };
+
+// GET /machines — the fleet, reduced to what operators act on:
+// name, IP, current version, and whether (and why) the machine errored.
+// Error machines are always listed first.
 router.get('/', authenticateToken, (req, res) => {
   const db = getDb();
 
-  const machines = db.prepare(`
+  const rows = db.prepare(`
     SELECT
       m.id,
       m.hostname,
-      m.machine_key,
+      m.ip_address,
       m.current_version,
-      m.target_version,
       m.last_heartbeat,
       m.last_update_result,
-      m.last_update_time,
-      m.last_update_message,
-      m.ip_address,
-      m.os_version,
-      s.name as site_name,
-      s.id as site_id,
-      c.name as customer_name,
-      c.id as customer_id
+      m.last_update_message
     FROM machines m
-    JOIN sites s ON m.site_id = s.id
-    JOIN customers c ON s.customer_id = c.id
-    ORDER BY c.name, s.name, m.hostname
   `).all();
 
-  // Compute status for each machine
   const now = new Date();
-  const enriched = machines.map(m => {
-    let status = 'online';
-    if (!m.last_heartbeat) {
-      status = 'unknown';
-    } else {
-      const lastSeen = new Date(m.last_heartbeat + 'Z');
-      const diffMinutes = (now - lastSeen) / 60000;
-      if (diffMinutes > OFFLINE_THRESHOLD) {
-        status = 'offline';
-      }
-    }
+  const machines = rows
+    .map((m) => {
+      const status = computeStatus(m, now);
+      return {
+        id: m.id,
+        hostname: m.hostname,
+        ip_address: m.ip_address,
+        current_version: m.current_version,
+        status,
+        error_reason:
+          status === 'error' ? m.last_update_message || m.last_update_result : null,
+        last_heartbeat: m.last_heartbeat,
+      };
+    })
+    .sort(
+      (a, b) =>
+        STATUS_ORDER[a.status] - STATUS_ORDER[b.status] ||
+        a.hostname.localeCompare(b.hostname)
+    );
 
-    if (m.last_update_result && m.last_update_result.includes('failure')) {
-      status = 'error';
-    }
-
-    return { ...m, status };
-  });
-
-  // Group by customer > site
-  const grouped = {};
-  for (const m of enriched) {
-    if (!grouped[m.customer_name]) {
-      grouped[m.customer_name] = { id: m.customer_id, sites: {} };
-    }
-    if (!grouped[m.customer_name].sites[m.site_name]) {
-      grouped[m.customer_name].sites[m.site_name] = { id: m.site_id, machines: [] };
-    }
-    grouped[m.customer_name].sites[m.site_name].machines.push(m);
-  }
-
-  res.json({ machines: enriched, grouped });
+  res.json({ machines });
 });
 
-// GET /api/machines/:id/history — status log for a single machine
-router.get('/:id/history', authenticateToken, (req, res) => {
-  const db = getDb();
-  const logs = db.prepare(`
-    SELECT * FROM status_log
-    WHERE machine_id = ?
-    ORDER BY created_at DESC
-    LIMIT 100
-  `).all(parseInt(req.params.id, 10));
-
-  res.json({ logs });
-});
-
-// GET /api/machines/summary — quick counts
+// GET /machines/summary — fleet-wide counts
+// (Registered before /:id/history so "summary" is never captured as a param.)
 router.get('/summary', authenticateToken, (req, res) => {
   const db = getDb();
-  const now = new Date().toISOString();
 
-  const total = db.prepare('SELECT COUNT(*) as count FROM machines').get().count;
-  const customers = db.prepare('SELECT COUNT(*) as count FROM customers').get().count;
-  const sites = db.prepare('SELECT COUNT(*) as count FROM sites').get().count;
+  const machines = db
+    .prepare('SELECT last_heartbeat, last_update_result FROM machines')
+    .all();
+  const customers = db.prepare('SELECT COUNT(*) AS count FROM customers').get().count;
+  const sites = db.prepare('SELECT COUNT(*) AS count FROM sites').get().count;
 
-  // Online = heartbeat within threshold
-  const thresholdDate = new Date(Date.now() - OFFLINE_THRESHOLD * 60000).toISOString();
-  const online = db.prepare('SELECT COUNT(*) as count FROM machines WHERE last_heartbeat > ?').get(thresholdDate).count;
-  const errors = db.prepare("SELECT COUNT(*) as count FROM machines WHERE last_update_result LIKE '%failure%'").get().count;
-  const offline = total - online;
+  // Statuses partition the fleet: online + offline + errors + unknown = total.
+  const now = new Date();
+  const counts = { online: 0, offline: 0, error: 0, unknown: 0 };
+  for (const m of machines) {
+    counts[computeStatus(m, now)] += 1;
+  }
 
-  res.json({ total, online, offline, errors, customers, sites });
+  res.json({
+    total: machines.length,
+    online: counts.online,
+    offline: counts.offline,
+    errors: counts.error,
+    unknown: counts.unknown,
+    customers,
+    sites,
+  });
 });
+
+// GET /machines/:id/history — paginated status log for one machine
+router.get(
+  '/:id/history',
+  authenticateToken,
+  validate({ params: idParamSchema, query: historyQuerySchema }),
+  (req, res) => {
+    const { id } = req.valid.params;
+    const { limit, offset } = req.valid.query;
+    const db = getDb();
+
+    const machine = db.prepare('SELECT id FROM machines WHERE id = ?').get(id);
+    if (!machine) {
+      throw ApiError.notFound('Machine not found');
+    }
+
+    const total = db
+      .prepare('SELECT COUNT(*) AS count FROM status_log WHERE machine_id = ?')
+      .get(id).count;
+
+    const logs = db.prepare(`
+      SELECT id, machine_id, event_type, version, result, message, ip_address, created_at
+      FROM status_log
+      WHERE machine_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ? OFFSET ?
+    `).all(id, limit, offset);
+
+    res.json({ logs, pagination: { limit, offset, total } });
+  }
+);
 
 module.exports = router;

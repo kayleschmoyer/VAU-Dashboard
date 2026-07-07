@@ -1,41 +1,61 @@
-require('dotenv').config();
+'use strict';
 
-const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
-const helmet = require('helmet');
-const path = require('path');
+const config = require('./config');
+const logger = require('./logger');
+const { getDb, closeDb } = require('./db');
+const createApp = require('./app');
 
-const authRoutes = require('./routes/auth');
-const statusRoutes = require('./routes/status');
-const machineRoutes = require('./routes/machines');
+// Open the database (runs migrations, seeds the first admin) before accepting
+// traffic — fail fast if the database is unusable.
+getDb();
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+const app = createApp();
 
-// Middleware
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors());
-app.use(morgan('combined'));
-app.use(express.json());
-
-// API Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/status', statusRoutes);
-app.use('/api/machines', machineRoutes);
-
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+const server = app.listen(config.port, () => {
+  logger.info(
+    { port: config.port, env: config.env, docs: `/api/v1/docs` },
+    'VAU Dashboard API listening'
+  );
 });
 
-// Serve React frontend in production
-const clientBuild = path.join(__dirname, '..', 'client', 'build');
-app.use(express.static(clientBuild));
-app.get('*', (req, res) => {
-  res.sendFile(path.join(clientBuild, 'index.html'));
+// Sensible timeouts for reverse-proxy deployments (Azure/IIS/nginx).
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, 'Shutting down gracefully');
+
+  server.close((err) => {
+    if (err) {
+      logger.error({ err }, 'Error closing HTTP server');
+    }
+    try {
+      closeDb();
+    } catch (dbErr) {
+      logger.error({ err: dbErr }, 'Error closing database');
+    }
+    process.exit(err ? 1 : 0);
+  });
+
+  // Force-exit if connections refuse to drain.
+  setTimeout(() => {
+    logger.warn('Forced shutdown after timeout');
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ err: reason }, 'Unhandled promise rejection — exiting');
+  shutdown('unhandledRejection');
 });
 
-app.listen(PORT, () => {
-  console.log(`VAU Dashboard API running on port ${PORT}`);
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'Uncaught exception — exiting');
+  process.exit(1);
 });

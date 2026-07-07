@@ -1,81 +1,127 @@
+'use strict';
+
 const express = require('express');
+const { z } = require('zod');
 const { getDb } = require('../db');
 const { authenticateApiKey } = require('../middleware/auth');
+const { validate } = require('../middleware/validate');
+const { nowIso } = require('../lib/time');
 
 const router = express.Router();
 
-// POST /api/status — VAU machines post status updates here
-// Headers: x-api-key
-// Body: { customer, site, hostname, machineKey, eventType, version, targetVersion, result, message, osVersion }
-router.post('/', authenticateApiKey, (req, res) => {
-  const {
-    customer,
-    site,
-    hostname,
-    machineKey,
-    eventType,    // "heartbeat" | "update_start" | "update_success" | "update_failure"
-    version,
-    targetVersion,
-    result,
-    message,
-    osVersion
-  } = req.body;
+const optionalString = (max) =>
+  z.string().trim().max(max).optional().nullable().transform((v) => v || null);
 
-  if (!customer || !site || !hostname || !machineKey || !eventType) {
-    return res.status(400).json({
-      error: 'Required fields: customer, site, hostname, machineKey, eventType'
-    });
-  }
+const statusEventSchema = z.object({
+  customer: z.string().trim().min(1).max(200),
+  site: z.string().trim().min(1).max(200),
+  hostname: z.string().trim().min(1).max(255),
+  machineKey: z.string().trim().min(1).max(255),
+  eventType: z.enum(['heartbeat', 'update_start', 'update_success', 'update_failure']),
+  version: optionalString(100),
+  targetVersion: optionalString(100),
+  result: optionalString(200),
+  message: optionalString(4000),
+  osVersion: optionalString(200),
+});
 
-  const db = getDb();
-  const ip = req.ip || req.connection.remoteAddress;
+// Single transaction: customer/site/machine upserts and the event log entry
+// either all commit or none do.
+function ingestEvent(db, event, ip) {
+  const now = nowIso();
 
-  // Upsert customer
-  db.prepare('INSERT OR IGNORE INTO customers (name) VALUES (?)').run(customer);
-  const customerRow = db.prepare('SELECT id FROM customers WHERE name = ?').get(customer);
+  const run = db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO customers (name, created_at) VALUES (?, ?)').run(event.customer, now);
+    const customer = db.prepare('SELECT id FROM customers WHERE name = ?').get(event.customer);
 
-  // Upsert site
-  db.prepare('INSERT OR IGNORE INTO sites (customer_id, name) VALUES (?, ?)').run(customerRow.id, site);
-  const siteRow = db.prepare('SELECT id FROM sites WHERE customer_id = ? AND name = ?').get(customerRow.id, site);
+    db.prepare('INSERT OR IGNORE INTO sites (customer_id, name, created_at) VALUES (?, ?, ?)').run(
+      customer.id,
+      event.site,
+      now
+    );
+    const site = db
+      .prepare('SELECT id FROM sites WHERE customer_id = ? AND name = ?')
+      .get(customer.id, event.site);
 
-  // Upsert machine
-  const existingMachine = db.prepare('SELECT id FROM machines WHERE machine_key = ?').get(machineKey);
+    const existing = db.prepare('SELECT id FROM machines WHERE machine_key = ?').get(event.machineKey);
 
-  if (!existingMachine) {
-    db.prepare(`
-      INSERT INTO machines (hostname, site_id, machine_key, current_version, target_version, last_heartbeat, ip_address, os_version)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-    `).run(hostname, siteRow.id, machineKey, version || null, targetVersion || null, ip, osVersion || null);
-  } else {
-    const updates = [
-      'hostname = ?', 'site_id = ?', 'last_heartbeat = CURRENT_TIMESTAMP', 'ip_address = ?'
-    ];
-    const params = [hostname, siteRow.id, ip];
+    const isUpdateResult =
+      event.eventType === 'update_success' || event.eventType === 'update_failure';
 
-    if (version) { updates.push('current_version = ?'); params.push(version); }
-    if (targetVersion) { updates.push('target_version = ?'); params.push(targetVersion); }
-    if (osVersion) { updates.push('os_version = ?'); params.push(osVersion); }
+    let machineId;
+    if (!existing) {
+      const inserted = db
+        .prepare(`
+          INSERT INTO machines (
+            hostname, site_id, machine_key, current_version, target_version,
+            last_heartbeat, ip_address, os_version, created_at,
+            last_update_result, last_update_time, last_update_message
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          event.hostname,
+          site.id,
+          event.machineKey,
+          event.version,
+          event.targetVersion,
+          now,
+          ip,
+          event.osVersion,
+          now,
+          isUpdateResult ? event.result || event.eventType : null,
+          isUpdateResult ? now : null,
+          isUpdateResult ? event.message : null
+        );
+      machineId = inserted.lastInsertRowid;
+    } else {
+      machineId = existing.id;
 
-    if (eventType === 'update_success' || eventType === 'update_failure') {
-      updates.push('last_update_result = ?');
-      params.push(result || eventType);
-      updates.push('last_update_time = CURRENT_TIMESTAMP');
-      updates.push('last_update_message = ?');
-      params.push(message || null);
+      const updates = ['hostname = ?', 'site_id = ?', 'last_heartbeat = ?', 'ip_address = ?'];
+      const params = [event.hostname, site.id, now, ip];
+
+      if (event.version) {
+        updates.push('current_version = ?');
+        params.push(event.version);
+      }
+      if (event.targetVersion) {
+        updates.push('target_version = ?');
+        params.push(event.targetVersion);
+      }
+      if (event.osVersion) {
+        updates.push('os_version = ?');
+        params.push(event.osVersion);
+      }
+      if (isUpdateResult) {
+        updates.push('last_update_result = ?', 'last_update_time = ?', 'last_update_message = ?');
+        params.push(event.result || event.eventType, now, event.message);
+      }
+
+      params.push(machineId);
+      db.prepare(`UPDATE machines SET ${updates.join(', ')} WHERE id = ?`).run(...params);
     }
 
-    params.push(machineKey);
-    db.prepare(`UPDATE machines SET ${updates.join(', ')} WHERE machine_key = ?`).run(...params);
-  }
+    db.prepare(`
+      INSERT INTO status_log (machine_id, event_type, version, result, message, ip_address, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(machineId, event.eventType, event.version, event.result, event.message, ip, now);
 
-  // Log the event
-  const machine = db.prepare('SELECT id FROM machines WHERE machine_key = ?').get(machineKey);
-  db.prepare(`
-    INSERT INTO status_log (machine_id, event_type, version, result, message, ip_address)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(machine.id, eventType, version || null, result || null, message || null, ip);
+    return machineId;
+  });
 
-  res.json({ success: true });
+  return run();
+}
+
+// POST /status — VAU machines post status updates here (x-api-key auth)
+router.post('/', authenticateApiKey, validate({ body: statusEventSchema }), (req, res) => {
+  const event = req.valid.body;
+  const machineId = ingestEvent(getDb(), event, req.ip || null);
+
+  req.log?.info(
+    { machineId, eventType: event.eventType, customer: event.customer, site: event.site },
+    'Status event ingested'
+  );
+  res.json({ success: true, machineId });
 });
 
 module.exports = router;

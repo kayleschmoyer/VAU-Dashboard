@@ -1,32 +1,44 @@
+'use strict';
+
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const config = require('../config');
+const { ApiError } = require('../errors');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-const VAU_API_KEY = process.env.VAU_API_KEY || 'dev-api-key';
+// Constant-time comparison, independent of input length.
+function safeEqual(a, b) {
+  const hashA = crypto.createHash('sha256').update(String(a)).digest();
+  const hashB = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
 
-// Middleware: verify JWT token for dashboard users
+// Verify JWT bearer token for dashboard users.
 function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
 
-  if (!token) {
-    return res.status(401).json({ error: 'Authentication required' });
+  if (!token || !/^Bearer$/i.test(scheme)) {
+    return next(ApiError.unauthorized());
   }
 
   try {
-    const user = jwt.verify(token, JWT_SECRET);
-    req.user = user;
+    req.user = jwt.verify(token, config.jwtSecret, {
+      issuer: config.jwtIssuer,
+      audience: config.jwtAudience,
+      algorithms: ['HS256'],
+    });
     next();
   } catch (err) {
-    return res.status(403).json({ error: 'Invalid or expired token' });
+    next(ApiError.unauthorized('Invalid or expired token', 'INVALID_TOKEN'));
   }
 }
 
-// Middleware: verify API key for VAU machine status POSTs
+// Verify API key for VAU machine status POSTs.
 function authenticateApiKey(req, res, next) {
   const apiKey = req.headers['x-api-key'];
 
-  if (!apiKey || apiKey !== VAU_API_KEY) {
-    return res.status(401).json({ error: 'Invalid API key' });
+  if (!apiKey || !safeEqual(apiKey, config.vauApiKey)) {
+    return next(ApiError.unauthorized('Invalid API key', 'INVALID_API_KEY'));
   }
 
   next();
@@ -35,8 +47,14 @@ function authenticateApiKey(req, res, next) {
 function generateToken(user) {
   return jwt.sign(
     { id: user.id, username: user.username },
-    JWT_SECRET,
-    { expiresIn: '24h' }
+    config.jwtSecret,
+    {
+      expiresIn: config.jwtExpiresIn,
+      issuer: config.jwtIssuer,
+      audience: config.jwtAudience,
+      algorithm: 'HS256',
+      jwtid: crypto.randomUUID(),
+    }
   );
 }
 

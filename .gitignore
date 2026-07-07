@@ -5,3 +5,6 @@ client/build/
 *.db
 *.db-journal
 dist/
+*.db-shm
+*.db-wal
+.claude/worktrees/
