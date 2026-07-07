@@ -1,0 +1,26 @@
+{
+  "name": "vau-dashboard",
+  "version": "1.0.0",
+  "description": "Monitoring Dashboard for VAST Auto Updater (VAU)",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "concurrently \"node server/index.js\" \"cd client && npm start\"",
+    "install-all": "npm install && cd client && npm install",
+    "build": "cd client && npm run build",
+    "seed": "node server/seed.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.1",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "helmet": "^8.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
