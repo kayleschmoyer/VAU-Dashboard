@@ -85,6 +85,38 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 3,
+    name: 'error-code-and-failure-kind',
+    up(database) {
+      // errorCode is optional in the client payload (older clients never send
+      // it). last_failure_kind records, at ingest time, whether the last
+      // failure happened before any update began ('deployment' — no
+      // targetVersion in the event) or during one ('update').
+      database.exec(`
+        ALTER TABLE status_log ADD COLUMN error_code TEXT;
+        ALTER TABLE machines ADD COLUMN last_error_code TEXT;
+        ALTER TABLE machines ADD COLUMN last_failure_kind TEXT;
+      `);
+    },
+  },
+  {
+    version: 4,
+    name: 'remove-debug-test-machines',
+    up(database) {
+      // One-time cleanup of machines created while debugging API
+      // connectivity. If either box reports in again it will simply
+      // re-register.
+      database.exec(`
+        DELETE FROM status_log WHERE machine_id IN (
+          SELECT id FROM machines WHERE hostname IN ('DEBUG-PROBE', 'DESKTOP-8073RJU')
+        );
+        DELETE FROM machines WHERE hostname IN ('DEBUG-PROBE', 'DESKTOP-8073RJU');
+        DELETE FROM sites WHERE id NOT IN (SELECT DISTINCT site_id FROM machines);
+        DELETE FROM customers WHERE id NOT IN (SELECT DISTINCT customer_id FROM sites);
+      `);
+    },
+  },
 ];
 
 function migrate(database) {

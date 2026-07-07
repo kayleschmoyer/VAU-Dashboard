@@ -145,7 +145,7 @@ test('status ingestion creates customer, site, and machine transactionally', asy
 });
 
 test('machines list returns slim actionable fields, errors first', async () => {
-  // Ingest a second machine whose last update failed.
+  // Ingest a second machine whose update failed mid-install (targetVersion set).
   await request(app)
     .post('/api/status')
     .set('x-api-key', API_KEY)
@@ -154,7 +154,9 @@ test('machines list returns slim actionable fields, errors first', async () => {
       hostname: 'POS-REGISTER-02',
       machineKey: 'test-machine-guid-002',
       eventType: 'update_failure',
+      targetVersion: '4.3.0',
       message: 'Installer exited with code 1603',
+      errorCode: 'InstallerFailed',
     });
 
   const res = await request(app)
@@ -167,16 +169,164 @@ test('machines list returns slim actionable fields, errors first', async () => {
   assert.equal(machine.status, 'online');
   assert.equal(machine.current_version, '4.3.0');
   assert.equal(machine.error_reason, null);
+  assert.equal(machine.customer, machineEvent.customer);
+  assert.equal(machine.site, machineEvent.site);
+  assert.equal(machine.needs_config, false);
   assert.deepEqual(
     Object.keys(machine).sort(),
-    ['current_version', 'error_reason', 'hostname', 'id', 'ip_address', 'last_heartbeat', 'status'],
+    [
+      'current_version',
+      'customer',
+      'error_code',
+      'error_kind',
+      'error_reason',
+      'hostname',
+      'id',
+      'ip_address',
+      'last_heartbeat',
+      'needs_config',
+      'site',
+      'status',
+    ],
     'list payload stays reduced to actionable fields'
   );
 
   const failed = res.body.machines.find((m) => m.hostname === 'POS-REGISTER-02');
   assert.equal(failed.status, 'error');
   assert.equal(failed.error_reason, 'Installer exited with code 1603');
+  assert.equal(failed.error_kind, 'update', 'failure with a targetVersion is an update problem');
+  assert.equal(failed.error_code, 'InstallerFailed');
   assert.equal(res.body.machines[0].status, 'error', 'error machines are listed first');
+});
+
+test('unconfigured machines (customer "Unknown") are flagged needs_config', async () => {
+  const res = await request(app)
+    .post('/api/status')
+    .set('x-api-key', API_KEY)
+    .send({
+      customer: 'Unknown',
+      site: 'FRESH-INSTALL-PC',
+      hostname: 'FRESH-INSTALL-PC',
+      machineKey: 'test-machine-guid-unconfigured',
+      eventType: 'heartbeat',
+    });
+  assert.equal(res.status, 200);
+
+  const list = await request(app)
+    .get('/api/machines')
+    .set('Authorization', `Bearer ${token}`);
+  const machine = list.body.machines.find((m) => m.hostname === 'FRESH-INSTALL-PC');
+  assert.ok(machine);
+  assert.equal(machine.needs_config, true);
+  assert.equal(machine.customer, 'Unknown');
+  assert.equal(machine.site, 'FRESH-INSTALL-PC');
+});
+
+test('pre-update failures (no targetVersion) surface as deployment problems', async () => {
+  await request(app)
+    .post('/api/status')
+    .set('x-api-key', API_KEY)
+    .send({
+      customer: 'Unknown',
+      site: 'BROKEN-DEPLOY-PC',
+      hostname: 'BROKEN-DEPLOY-PC',
+      machineKey: 'test-machine-guid-no-vast',
+      eventType: 'update_failure',
+      message: 'VAST.exe not found on any drive',
+      errorCode: 'VastNotFound',
+    });
+
+  const list = await request(app)
+    .get('/api/machines')
+    .set('Authorization', `Bearer ${token}`);
+  const machine = list.body.machines.find((m) => m.hostname === 'BROKEN-DEPLOY-PC');
+  assert.equal(machine.status, 'error');
+  assert.equal(machine.error_kind, 'deployment');
+  assert.equal(machine.error_code, 'VastNotFound');
+  assert.equal(machine.error_reason, 'VAST.exe not found on any drive');
+
+  // errorCode is persisted on the log entry as well.
+  const history = await request(app)
+    .get(`/api/machines/${machine.id}/history`)
+    .set('Authorization', `Bearer ${token}`);
+  assert.equal(history.body.logs[0].error_code, 'VastNotFound');
+
+  // A later success clears the failure classification.
+  await request(app)
+    .post('/api/status')
+    .set('x-api-key', API_KEY)
+    .send({
+      customer: 'Unknown',
+      site: 'BROKEN-DEPLOY-PC',
+      hostname: 'BROKEN-DEPLOY-PC',
+      machineKey: 'test-machine-guid-no-vast',
+      eventType: 'update_success',
+      version: '4.3.0',
+      targetVersion: '4.3.0',
+    });
+  const after = await request(app)
+    .get('/api/machines')
+    .set('Authorization', `Bearer ${token}`);
+  const recovered = after.body.machines.find((m) => m.hostname === 'BROKEN-DEPLOY-PC');
+  assert.equal(recovered.status, 'online');
+  assert.equal(recovered.error_kind, null);
+  assert.equal(recovered.error_code, null);
+});
+
+test('errorCode remains optional for older clients', async () => {
+  const res = await request(app)
+    .post('/api/status')
+    .set('x-api-key', API_KEY)
+    .send({ ...machineEvent, machineKey: 'test-machine-guid-legacy', hostname: 'LEGACY-CLIENT' });
+  assert.equal(res.status, 200);
+});
+
+test('machines can be deleted, taking their history and orphaned groupings along', async () => {
+  await request(app)
+    .post('/api/status')
+    .set('x-api-key', API_KEY)
+    .send({
+      customer: 'Delete Me Corp',
+      site: 'Solo Site',
+      hostname: 'DOOMED-PC',
+      machineKey: 'test-machine-guid-doomed',
+      eventType: 'heartbeat',
+    });
+
+  const list = await request(app)
+    .get('/api/machines')
+    .set('Authorization', `Bearer ${token}`);
+  const doomed = list.body.machines.find((m) => m.hostname === 'DOOMED-PC');
+  assert.ok(doomed);
+
+  // Delete requires a dashboard JWT, not an API key.
+  const noAuth = await request(app).delete(`/api/machines/${doomed.id}`);
+  assert.equal(noAuth.status, 401);
+
+  const res = await request(app)
+    .delete(`/api/machines/${doomed.id}`)
+    .set('Authorization', `Bearer ${token}`);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.success, true);
+
+  const after = await request(app)
+    .get('/api/machines')
+    .set('Authorization', `Bearer ${token}`);
+  assert.ok(!after.body.machines.some((m) => m.id === doomed.id), 'machine is gone from the list');
+  assert.ok(
+    !after.body.machines.some((m) => m.customer === 'Delete Me Corp'),
+    'orphaned customer is pruned'
+  );
+
+  const history = await request(app)
+    .get(`/api/machines/${doomed.id}/history`)
+    .set('Authorization', `Bearer ${token}`);
+  assert.equal(history.status, 404);
+
+  const missing = await request(app)
+    .delete('/api/machines/999999')
+    .set('Authorization', `Bearer ${token}`);
+  assert.equal(missing.status, 404);
 });
 
 test('summary counts are consistent with the machine list', async () => {
