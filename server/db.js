@@ -100,23 +100,6 @@ const MIGRATIONS = [
       `);
     },
   },
-  {
-    version: 4,
-    name: 'remove-debug-test-machines',
-    up(database) {
-      // One-time cleanup of machines created while debugging API
-      // connectivity. If either box reports in again it will simply
-      // re-register.
-      database.exec(`
-        DELETE FROM status_log WHERE machine_id IN (
-          SELECT id FROM machines WHERE hostname IN ('DEBUG-PROBE', 'DESKTOP-8073RJU')
-        );
-        DELETE FROM machines WHERE hostname IN ('DEBUG-PROBE', 'DESKTOP-8073RJU');
-        DELETE FROM sites WHERE id NOT IN (SELECT DISTINCT site_id FROM machines);
-        DELETE FROM customers WHERE id NOT IN (SELECT DISTINCT customer_id FROM sites);
-      `);
-    },
-  },
 ];
 
 function migrate(database) {
