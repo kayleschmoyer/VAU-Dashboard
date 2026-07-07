@@ -60,12 +60,30 @@ const openApiDocument = {
         properties: {
           id: { type: 'integer' },
           hostname: { type: 'string' },
+          customer: { type: 'string' },
+          site: { type: 'string' },
+          needs_config: {
+            type: 'boolean',
+            description:
+              'True when the machine reports customer "Unknown" — a fresh install whose updater Settings have not been filled in yet.',
+          },
           ip_address: { type: ['string', 'null'] },
           current_version: { type: ['string', 'null'] },
           status: { type: 'string', enum: ['online', 'offline', 'error', 'unknown'] },
           error_reason: {
             type: ['string', 'null'],
             description: 'Why the last update failed. Only set when status is "error".',
+          },
+          error_kind: {
+            type: ['string', 'null'],
+            enum: ['deployment', 'update', null],
+            description:
+              '"deployment" = failed before any update began (e.g. no VAST install); ' +
+              '"update" = download/install failure. Only set when status is "error".',
+          },
+          error_code: {
+            type: ['string', 'null'],
+            description: 'Machine-readable code from the client, when it sent one.',
           },
           last_heartbeat: { type: ['string', 'null'] },
         },
@@ -91,6 +109,14 @@ const openApiDocument = {
           result: { type: 'string', maxLength: 200 },
           message: { type: 'string', maxLength: 4000 },
           osVersion: { type: 'string', maxLength: 200 },
+          errorCode: {
+            type: 'string',
+            maxLength: 100,
+            description:
+              'Optional machine-readable failure code. Known values: VastNotFound, ' +
+              'VersionParseError, ConnectionFailed, DownloadFailed, HashMismatch, ' +
+              'InstallerFailed, Unknown. Older clients omit this field.',
+          },
         },
       },
       LogEntry: {
@@ -102,6 +128,7 @@ const openApiDocument = {
           version: { type: ['string', 'null'] },
           result: { type: ['string', 'null'] },
           message: { type: ['string', 'null'] },
+          error_code: { type: ['string', 'null'] },
           ip_address: { type: ['string', 'null'] },
           created_at: { type: 'string' },
         },
@@ -278,6 +305,32 @@ const openApiDocument = {
             },
           },
           401: errorResponse('Missing or invalid token'),
+        },
+      },
+    },
+    '/machines/{id}': {
+      delete: {
+        tags: ['Machines'],
+        summary: 'Permanently delete a machine and its status history',
+        description:
+          'Removes the machine and all of its status log entries; orphaned sites and customers are ' +
+          'pruned. If the machine is still running the updater it will re-register on its next report.',
+        security: [{ bearerAuth: [] }],
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'integer', minimum: 1 } },
+        ],
+        responses: {
+          200: {
+            description: 'Machine deleted',
+            content: {
+              'application/json': {
+                schema: { type: 'object', properties: { success: { type: 'boolean' } } },
+              },
+            },
+          },
+          400: errorResponse('Invalid id'),
+          401: errorResponse('Missing or invalid token'),
+          404: errorResponse('Machine not found'),
         },
       },
     },

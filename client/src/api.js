@@ -97,3 +97,7 @@ export async function getSummary() {
 export async function getMachineHistory(id, { limit = 50, offset = 0 } = {}) {
   return apiFetch(`/machines/${id}/history?limit=${limit}&offset=${offset}`);
 }
+
+export async function deleteMachine(id) {
+  return apiFetch(`/machines/${id}`, { method: 'DELETE' });
+}

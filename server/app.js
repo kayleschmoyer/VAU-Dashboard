@@ -74,7 +74,7 @@ function createApp() {
     app.use(
       cors({
         origin: config.corsOrigins,
-        methods: ['GET', 'POST'],
+        methods: ['GET', 'POST', 'DELETE'],
         allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'x-request-id'],
         maxAge: 600,
       })

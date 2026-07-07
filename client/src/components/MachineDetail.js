@@ -15,7 +15,7 @@ function EventBadge({ type }) {
   return <span className={`event-badge event-${variant}`}>{type.replace(/_/g, ' ')}</span>;
 }
 
-export default function MachineDetail({ machine, onClose }) {
+export default function MachineDetail({ machine, onClose, onDelete }) {
   const [logs, setLogs] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -61,11 +61,35 @@ export default function MachineDetail({ machine, onClose }) {
 
       {machine.status === 'error' && (
         <div className="error-callout" role="alert">
-          <strong>Why it errored:</strong> {machine.error_reason || 'Update failed'}
+          <strong>
+            {machine.error_kind === 'deployment' ? 'Deployment problem:' : 'Why it errored:'}
+          </strong>{' '}
+          {machine.error_reason || 'Update failed'}
+          {machine.error_kind === 'deployment' && (
+            <div className="error-callout-hint">
+              This machine failed before any update began — likely no working VAST installation.
+            </div>
+          )}
+          {machine.error_code && <span className="chip error-code-chip">{machine.error_code}</span>}
+        </div>
+      )}
+
+      {machine.needs_config && (
+        <div className="config-callout">
+          <strong>Needs configuration:</strong> this machine hasn't been assigned to a customer
+          yet. Enter the Customer Name and Site Number in the updater's Settings on the machine.
         </div>
       )}
 
       <dl className="detail-grid">
+        <div className="detail-item">
+          <dt>Customer</dt>
+          <dd>{machine.needs_config ? '— (unconfigured)' : machine.customer || '—'}</dd>
+        </div>
+        <div className="detail-item">
+          <dt>Site</dt>
+          <dd>{machine.site || '—'}</dd>
+        </div>
         <div className="detail-item">
           <dt>IP address</dt>
           <dd className="cell-mono">{machine.ip_address || '—'}</dd>
@@ -109,7 +133,10 @@ export default function MachineDetail({ machine, onClose }) {
                     <td className="nowrap">{formatTime(log.created_at)}</td>
                     <td><EventBadge type={log.event_type} /></td>
                     <td>{log.version || '—'}</td>
-                    <td className="log-message">{log.message || log.result || '—'}</td>
+                    <td className="log-message">
+                      {log.message || log.result || '—'}
+                      {log.error_code && <span className="chip error-code-chip">{log.error_code}</span>}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -121,6 +148,14 @@ export default function MachineDetail({ machine, onClose }) {
             </button>
           )}
         </>
+      )}
+
+      {onDelete && (
+        <div className="detail-footer">
+          <button className="btn btn-ghost btn-ghost-danger" onClick={onDelete}>
+            Delete this machine…
+          </button>
+        </div>
       )}
     </Modal>
   );

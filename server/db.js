@@ -85,6 +85,21 @@ const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 3,
+    name: 'error-code-and-failure-kind',
+    up(database) {
+      // errorCode is optional in the client payload (older clients never send
+      // it). last_failure_kind records, at ingest time, whether the last
+      // failure happened before any update began ('deployment' — no
+      // targetVersion in the event) or during one ('update').
+      database.exec(`
+        ALTER TABLE status_log ADD COLUMN error_code TEXT;
+        ALTER TABLE machines ADD COLUMN last_error_code TEXT;
+        ALTER TABLE machines ADD COLUMN last_failure_kind TEXT;
+      `);
+    },
+  },
 ];
 
 function migrate(database) {

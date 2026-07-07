@@ -23,6 +23,11 @@ const statusEventSchema = z.object({
   result: optionalString(200),
   message: optionalString(4000),
   osVersion: optionalString(200),
+  // Known values: VastNotFound, VersionParseError, ConnectionFailed,
+  // DownloadFailed, HashMismatch, InstallerFailed, Unknown. Kept as a free
+  // string so newer clients can add codes without a dashboard deploy; older
+  // clients omit it entirely.
+  errorCode: optionalString(100),
 });
 
 // Single transaction: customer/site/machine upserts and the event log entry
@@ -48,6 +53,16 @@ function ingestEvent(db, event, ip) {
     const isUpdateResult =
       event.eventType === 'update_success' || event.eventType === 'update_failure';
 
+    // A failure with no targetVersion happened before any update began
+    // (e.g. "VAST.exe not found on any drive") — a deployment problem, not a
+    // download/install problem.
+    const failureKind =
+      event.eventType === 'update_failure'
+        ? event.targetVersion
+          ? 'update'
+          : 'deployment'
+        : null;
+
     let machineId;
     if (!existing) {
       const inserted = db
@@ -55,9 +70,10 @@ function ingestEvent(db, event, ip) {
           INSERT INTO machines (
             hostname, site_id, machine_key, current_version, target_version,
             last_heartbeat, ip_address, os_version, created_at,
-            last_update_result, last_update_time, last_update_message
+            last_update_result, last_update_time, last_update_message,
+            last_error_code, last_failure_kind
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           event.hostname,
@@ -71,7 +87,9 @@ function ingestEvent(db, event, ip) {
           now,
           isUpdateResult ? event.result || event.eventType : null,
           isUpdateResult ? now : null,
-          isUpdateResult ? event.message : null
+          isUpdateResult ? event.message : null,
+          event.eventType === 'update_failure' ? event.errorCode : null,
+          failureKind
         );
       machineId = inserted.lastInsertRowid;
     } else {
@@ -93,8 +111,20 @@ function ingestEvent(db, event, ip) {
         params.push(event.osVersion);
       }
       if (isUpdateResult) {
-        updates.push('last_update_result = ?', 'last_update_time = ?', 'last_update_message = ?');
-        params.push(event.result || event.eventType, now, event.message);
+        updates.push(
+          'last_update_result = ?',
+          'last_update_time = ?',
+          'last_update_message = ?',
+          'last_error_code = ?',
+          'last_failure_kind = ?'
+        );
+        params.push(
+          event.result || event.eventType,
+          now,
+          event.message,
+          event.eventType === 'update_failure' ? event.errorCode : null,
+          failureKind
+        );
       }
 
       params.push(machineId);
@@ -102,9 +132,9 @@ function ingestEvent(db, event, ip) {
     }
 
     db.prepare(`
-      INSERT INTO status_log (machine_id, event_type, version, result, message, ip_address, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(machineId, event.eventType, event.version, event.result, event.message, ip, now);
+      INSERT INTO status_log (machine_id, event_type, version, result, message, error_code, ip_address, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(machineId, event.eventType, event.version, event.result, event.message, event.errorCode, ip, now);
 
     return machineId;
   });
