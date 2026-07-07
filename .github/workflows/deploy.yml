@@ -27,7 +27,7 @@ jobs:
 
       - name: Create deployment package
         run: |
-          mkdir deploy
+          mkdir -p deploy/client
           cp -r server deploy/
           cp -r client/build deploy/client/build
           cp package.json package-lock.json deploy/
